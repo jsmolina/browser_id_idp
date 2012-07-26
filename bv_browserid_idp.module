@@ -1,0 +1,345 @@
+<?php
+define('BROWSERID_COOKIE', 'idp_cookie');
+define('BROWSERID_SALT', 'aB34xYZZOp');
+
+
+/**
+ * hook_menu
+ * @return array()
+ */
+function bv_browserid_idp_menu() {
+    $items = array();    
+    
+    
+    $items['browserid/signin'] = array(
+            'title'             => 'Sign in',
+            'description'       => 'BrowserId Signin',
+            'page callback'     => 'bv_browserid_idp_signin',            
+            'access callback'   => TRUE,
+            'type'              => MENU_CALLBACK,
+    );
+    
+    $items['browserid/provision'] = array(
+            'title'             => 'Provisioning url',
+            'description'       => 'provisioning',
+            'page callback'     => 'bv_browserid_idp_provisioning',
+            'access callback'   => TRUE,
+            'type'              => MENU_CALLBACK,
+    );
+    
+    $items['browserid/gencert'] = array(
+            'title'             => 'Generates certicate',
+            'description'       => 'calls node.js and returns the certificate',
+            'page callback'     => 'bv_browserid_idp_gencert',
+            'access callback'   => TRUE,
+            'type'              => MENU_CALLBACK,
+    );
+
+    $items['admin/browserid'] = array(
+            'title'             => 'Generates certicate',
+            'description'       => 'calls node.js and returns the certificate',
+            'page callback'     => 'bv_browserid_idp_gencert',
+            'access callback'   => TRUE,
+            'type'              => MENU_CALLBACK,
+    );
+    return $items;
+}
+
+/**
+ * Menu callback for signin
+ * @global stdClass $user
+ * @return page
+ */
+function bv_browserid_idp_signin() {          
+    global $user;
+    $output = '';    
+    $emailAddress = $user->name;
+    
+    // NOTE: altering trusted drupal sessions to own system only needs to 
+    // create a function like module_name_browserid_trusted_session_alter
+    drupal_alter('browserid_trusted_session', $emailAddress);  
+    
+    $output .= theme(
+        'bvp_browserid_idp_signin',
+        variable_get('bvp_browserid_js', 'https://dev.diresworb.org/'),
+        _bv_browserid_generate_email(),
+        $emailAddress
+    );
+    
+    return $output;
+}
+
+/**
+ * hook_user: add the cookie on login
+ * @param type $op
+ * @param type $edit
+ * @param type $account
+ * @param type $category
+ */
+function bv_browserid_idp_user($op, &$edit, &$account, $category = NULL) {
+    if($op === 'login' && arg(0) === 'browserid') {  
+        $browserIdMail = _bv_browserid_generate_email();
+        _bv_browserid_idp_create_cookie(BROWSERID_COOKIE, $browserIdMail, TRUE);
+    } else if($op === 'logout') {
+        _bv_browserid_idp_delete_cookie(BROWSERID_COOKIE);
+    }
+}
+
+/**
+ * Menu callback: provisioning url
+ * @global stdClass $user
+ */
+function bv_browserid_idp_provisioning() {    
+    $output = '';
+    $xsrf = _bv_browserid_idp_getCacheCSRF();
+    global $user;    
+    
+    
+    $userLogged = !empty($user->uid) && 
+        _bv_browserid_idp_verify_cookie(
+            BROWSERID_COOKIE, 
+            _bv_browserid_generate_email()
+        );    
+    
+    $userActivated = !empty($user->uid) && $user->status == 1;
+    
+    
+    $output .= theme(
+        'bvp_browserid_idp_provisioning', 
+        variable_get('bvp_browserid_js', 'https://dev.diresworb.org/'),
+        _bv_browserid_generate_email(),
+        ($userActivated && $userLogged)? 'true' : 'false', 
+        $xsrf->getHash()
+    );
+    
+    watchdog(
+        'bv_browserid', 
+        '[PROVISIONING] activated? "%status", logged-in? "%logged"',
+        array('%status' => $userActivated, '%logged' => $userLogged)
+    );
+    
+    /** @todo check if bvp_browserid_domain is substring of base_url*/
+    
+    print $output;
+    exit;
+}
+
+
+
+function bv_browserid_idp_theme($existing, $type, $theme, $path)
+{
+    
+    return array(
+        'bvp_browserid_idp_signin' => array(            
+            'template' => 'theme/bvp_browserid_idp_signin',
+             'arguments' => array(
+                'bvp_browserid_js'    => NULL,
+                'bvp_browserid_email' => NULL,                
+                'sessionEmail'  => NULL,
+             )
+        ),
+        'bvp_browserid_idp_provisioning' => array(            
+            'template' => 'theme/bvp_browserid_idp_provisioning',
+            'arguments' => array(
+                'bvp_browserid_js'    => NULL,
+                'bvp_browserid_email' => NULL,
+                'bvp_browserid_loggedin' => NULL,
+                'bvp_browserid_xsrf' => NULL,                
+             )
+        ),
+    );
+}
+
+
+function bv_browserid_idp_gencert() {
+    //$_POST email, publicKey, duration
+    list($email, $duration, $publicKey) = _bv_browser_idp_validate();
+
+    $data = json_encode((object) array(
+            'email'     => $email,
+            'duration'  => $duration,
+            'pubkey' => $publicKey
+        )
+    );
+
+    $response = drupal_http_request(
+        variable_get('browserid_nodejs_certifier', 'http://localhost:8080/cert_key'),
+        array(
+            'method' => 'POST',
+            'data' => $data,
+            'headers' => array('Content-Type'=> 'application/json')
+        )
+    );
+    
+    if($response->code == 200) {
+        $code = $response->code;
+        $body = $response->data;
+        $parsedBody = json_decode($body);
+        if($parsedBody !== NULL && $parsedBody->success === true) {
+            print $parsedBody->certificate; //json
+            exit;
+        }
+    }
+    print "response is empty";
+    // set error response code
+    exit;
+}
+
+
+/**
+ * Generates browserID email
+ * @global stdClass $user 
+ * @return string browser id email
+ */
+function _bv_browserid_generate_email() {
+    global $user;
+    $domain = variable_get('bvp_browserid_domain', NULL);
+    if($domain === NULL) {
+        drupal_set_message(t('Please, setup the domain env variable on your settings.php ($conf[\'bvp_browserid_domain\')!'));
+    }
+    return $user->name . '@' . variable_get('bvp_browserid_domain', NULL);
+}
+
+
+/**
+ * Create trusted session cookie
+ * @global string $base_url
+ * @param string $cookieName
+ * @param string $email
+ * @param boolean $secure
+ */
+function _bv_browserid_idp_create_cookie($cookieName, $email, $secure) {
+    global $base_url;
+    
+    $appSecret = variable_get(
+        'bv_browser_idp',
+        'adsfad03432XYZPASFA'
+    );
+    
+    $iv = $email . $appSecret;
+    
+    $hashedEmail = sha1($email . BROWSERID_SALT);
+    
+    $cypheredHash = openssl_encrypt(
+        $hashedEmail,
+        'AES-128-CBC',
+        $appSecret,
+        $iv
+    );
+    
+    setcookie(
+        $cookieName, // name
+        $cypheredHash, // value
+        time() + 3600, // expiry time (1 hour)
+        '/', // path
+        parse_url($base_url, PHP_URL_HOST), // domain
+        $secure, // secure?
+        true // http only?
+    );
+}
+
+/**
+ * Remove IDP cookie for user
+ * @global string $base_url
+ * @param string $cookieName
+ */
+function _bv_browserid_idp_delete_cookie($cookieName) {
+    global $base_url;
+    setcookie(
+        $cookieName, 
+        null, 
+        time() - 3600, 
+        '/', 
+        parse_url($base_url, PHP_URL_HOST), 
+        true,
+        true
+    );
+}
+
+/**
+ * Verify that cookie is right
+ * @param string $cookieName
+ * @param string $email
+ * @return boolean TRUE if it is verified as OK
+ */
+function _bv_browserid_idp_verify_cookie($cookieName, $email) {
+    $cookieContents = $_COOKIE[$cookieName];
+    
+    $appSecret = variable_get(
+        'bv_browser_idp',
+        'adsfad03432XYZPASFA'
+    );
+    
+    $iv = $email . $appSecret;
+    
+    $unCypheredHash = openssl_decrypt(
+        $cookieContents,
+        'AES-128-CBC',
+        $appSecret,
+        $iv
+    );
+    
+    return !empty($unCypheredHash) && $unCypheredHash === sha1($email . BROWSERID_SALT);
+}
+
+/**
+ * Function to perform a fail call to Asynchronous methods
+ * @param type $msg
+ */
+function _bv_browser_idp_fail($msg) {
+    print json_encode(array('error' => $msg)); // @todo: add t
+    exit;
+}
+
+/**
+ * Validate POST contents
+ * @return type
+ */
+function _bv_browser_idp_validate() {
+    watchdog(
+        'bv_browserid', 
+        'POST: %post_contents and duration is "%duration"', 
+        array('%post_contents' => print_r($_POST,1), '%duration' => $_POST['duration']), 
+        WATCHDOG_NOTICE
+    );
+    
+    
+    if(!isset($_POST['email']) || !isset($_POST['publicKey']) || !isset($_POST['duration'])) {
+        _bv_browser_idp_fail('email, publicKey, duration are required');
+    }
+    // @phones.bluevia.com
+    // email must be an email @phones.bluevia.com
+    if(!_helper_is_mail($_POST['email']) && strstr($_POST['email'], '@phones.bluevia.com') === FALSE) {        
+        _bv_browser_idp_fail('email must be well-formed');
+    }
+    
+    // publicKey must be json
+    if(json_decode($_POST['publicKey']) === NULL) {        
+        _bv_browser_idp_fail('publicKey is invalid');
+    }
+    
+    // duration integer
+    if(!isset($_POST['duration']) || !is_numeric($_POST['duration'])) {
+        _bv_browser_idp_fail('duration must be an integer');
+    }
+    
+    $xsrf = _bv_browserid_idp_getCacheCSRF();
+    if(!isset($_POST['xsrf']) || !$xsrf->validateHash($_POST['xsrf'], true)) {
+        _bv_browser_idp_fail('error validating form');
+    }
+    
+    return array($_POST['email'], (int) $_POST['duration'], $_POST['publicKey']);
+}
+
+
+/**
+ * Generates a new CSRF token 
+ * @return \CacheCSRF
+ */
+function _bv_browserid_idp_getCacheCSRF() {
+    require_once __DIR__ . DIRECTORY_SEPARATOR . 'class'.DIRECTORY_SEPARATOR.'CacheCSRF.php';
+    $xsrf = new CacheCSRF();
+    $xsrf->setName(md5(session_id() . '8d5er'));    
+    $xsrf->setSalt('9eb5k');
+    return $xsrf;
+}
